@@ -24,7 +24,7 @@ use netlink_packet_route::{
 use netlink_sys::{AsyncSocket, SocketAddr};
 use rtnetlink::{new_connection, Handle, IpVersion, NeighbourAddRequest, RouteMessageBuilder};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::config::IpProtocol;
 use crate::utils::{IpAddress, IpNetwork};
@@ -419,13 +419,37 @@ struct RouteDescriber<N> {
     destination: N,
     output_if_index: u32,
     table_id: u32,
+    route_type: RouteType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RouteType {
+    HairpinDest,
+    DefaultRoute,
 }
 
 impl<N: RouteIpNetwork> RouteDescriber<N> {
     fn matches(&self, route: &RouteMessage) -> bool {
-        Some(self.destination) == route_destination(route)
+        let dest_match = if self.is_default_route() {
+            // 对于默认路由，检查是否是默认路由（destination_prefix_length == 0 且没有 Destination 属性）
+            route.header.destination_prefix_length == 0
+                && route_destination::<N>(route).is_none()
+        } else {
+            // 对于 hairpin 目标路由，使用原有的匹配逻辑
+            Some(self.destination) == route_destination(route)
+        };
+
+        dest_match
             && self.table_id == route_table_id(route)
             && Some(self.output_if_index) == route_output_if_index(route)
+    }
+
+    fn is_default_route(&self) -> bool {
+        self.route_type == RouteType::DefaultRoute
+    }
+
+    fn is_hairpin_dest(&self) -> bool {
+        self.route_type == RouteType::HairpinDest
     }
 }
 
@@ -436,6 +460,7 @@ pub struct HairpinRouting<N> {
     ip_rule_pref: u32,
     local_ip_rule_pref: u32,
     internal_if_names: Vec<String>,
+    internal_if_indices: std::collections::HashMap<String, u32>,
     ip_protocols: Vec<IpProtocol>,
     hairpin_dests: Vec<N>,
     rules: Vec<RuleMessage>,
@@ -445,7 +470,7 @@ pub struct HairpinRouting<N> {
     hairpin_rule_configured: bool,
 }
 
-impl<N: RouteIpNetwork> HairpinRouting<N> {
+impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
     pub fn new(
         rt_helper: RouteHelper,
         external_if_index: u32,
@@ -464,6 +489,7 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
             ip_rule_pref,
             local_ip_rule_pref,
             internal_if_names,
+            internal_if_indices: std::collections::HashMap::new(),
             ip_protocols,
             hairpin_dests: Default::default(),
             rules: Default::default(),
@@ -478,10 +504,138 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
         &self.rt_helper.handle
     }
 
+    /// 设置内部接口索引映射
+    pub async fn resolve_internal_interfaces(&mut self) -> Result<()> {
+        self.internal_if_indices.clear();
+
+        info!("Resolving internal interfaces: {:?}", self.internal_if_names);
+
+        for if_name in &self.internal_if_names {
+            if let Ok(Some(link)) = self.handle().link().get().match_name(if_name.clone()).execute().try_next().await {
+                info!("Found interface {} with index {}", if_name, link.header.index);
+                self.internal_if_indices.insert(if_name.clone(), link.header.index);
+            } else {
+                warn!("Interface '{}' not found, skipping default route addition", if_name);
+            }
+        }
+
+        if self.internal_if_indices.is_empty() {
+            warn!("No valid internal interfaces found for default route configuration");
+        }
+
+        Ok(())
+    }
+
+    /// 添加默认路由到指定的路由表
+    async fn add_default_route(&mut self, output_if_index: u32) -> Result<()> {
+        info!("Adding default route: table_id={}, output_if_index={}", self.table_id, output_if_index);
+
+        // 验证接口是否存在
+        match self.handle().link().get().match_index(output_if_index).execute().try_next().await {
+            Ok(Some(link)) => {
+                info!("Confirmed interface exists: index={}, name={}",
+                      output_if_index, link_name(&link));
+            }
+            Ok(None) => {
+                error!("Interface with index {} does not exist!", output_if_index);
+                return Err(anyhow::anyhow!("Interface {} not found", output_if_index));
+            }
+            Err(e) => {
+                error!("Failed to verify interface {}: {:?}", output_if_index, e);
+                return Err(anyhow::anyhow!("Interface verification failed: {}", e));
+            }
+        }
+
+        // 方法1: 尝试使用 RouteMessageBuilder 直接创建最简单的默认路由
+        let route1 = RouteMessageBuilder::<IpAddr>::new()
+            .table_id(self.table_id)
+            .output_interface(output_if_index)
+            .build();
+
+        info!("Attempting to add default route using RouteMessageBuilder");
+        if let Err(e1) = self.handle().route().add(route1).execute().await {
+            if route_err_is_exist(&e1) {
+                info!("Default route already exists in table {}", self.table_id);
+            } else {
+                // 这是正常情况，某些内核版本不支持第一种方法
+                info!("RouteMessageBuilder approach not supported (error: {:?}), trying fallback method", e1);
+
+                // 方法2: 尝试使用默认的目标地址方法 (0.0.0.0/0)
+                info!("Attempting to add default route with 0.0.0.0/0 destination");
+                let default_dest = if N::IS_IPV4 {
+                    N::from_route_address(&RouteAddress::Inet(Ipv4Addr::new(0, 0, 0, 0)), 0)
+                        .expect("Failed to create IPv4 default route")
+                } else {
+                    #[cfg(feature = "ipv6")]
+                    {
+                        N::from_route_address(&RouteAddress::Inet6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 0)
+                            .expect("Failed to create IPv6 default route")
+                    }
+                    #[cfg(not(feature = "ipv6"))]
+                    {
+                        panic!("IPv6 support not enabled");
+                    }
+                };
+
+                let route2 = RouteMessageBuilder::<IpAddr>::new()
+                    .table_id(self.table_id)
+                    .output_interface(output_if_index)
+                    .destination_prefix(default_dest.ip_addr(), default_dest.prefix_len())
+                    .expect("invalid default dest")
+                    .build();
+
+                if let Err(e2) = self.handle().route().add(route2).execute().await {
+                    if route_err_is_exist(&e2) {
+                        info!("Default route already exists in table {}", self.table_id);
+                    } else {
+                        error!("Both default route creation methods failed");
+                        error!("Method 1 error: {:?}", e1);
+                        error!("Method 2 error: {:?}", e2);
+                        error!("Route details: table_id={}, output_if_index={}",
+                               self.table_id, output_if_index);
+                        return Err(anyhow::anyhow!("Failed to add default route: both methods failed"));
+                    }
+                } else {
+                    info!("Successfully added default route using fallback method (0.0.0.0/0)");
+                }
+            }
+        } else {
+            info!("Successfully added default route using RouteMessageBuilder");
+        }
+
+        // 记录默认路由描述符 - 使用空的默认目标
+        let default_dest = if N::IS_IPV4 {
+            N::from_route_address(&RouteAddress::Inet(Ipv4Addr::new(0, 0, 0, 0)), 0)
+                .expect("Failed to create IPv4 default route")
+        } else {
+            #[cfg(feature = "ipv6")]
+            {
+                N::from_route_address(&RouteAddress::Inet6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 0)
+                    .expect("Failed to create IPv6 default route")
+            }
+            #[cfg(not(feature = "ipv6"))]
+            {
+                panic!("IPv6 support not enabled");
+            }
+        };
+
+        self.routes.push(RouteDescriber {
+            destination: default_dest,
+            output_if_index,
+            table_id: self.table_id,
+            route_type: RouteType::DefaultRoute,
+        });
+
+        Ok(())
+    }
+
     async fn reconfigure_(&mut self, hairpin_dests: Vec<N>) -> Result<()> {
         self.reconfigure_dests(hairpin_dests).await?;
 
         if !self.hairpin_rule_configured {
+            // 解析内部接口索引
+            self.resolve_internal_interfaces().await?;
+
             if !self.internal_if_names.is_empty() {
                 self.rt_helper
                     .deprioritize_local_ip_rule(N::IS_IPV4, self.local_ip_rule_pref)
@@ -492,6 +646,17 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
                 for protocol in self.ip_protocols.clone() {
                     self.add_rule(&iif_name, protocol.into(), self.ip_rule_pref)
                         .await?;
+                }
+            }
+
+            // 为每个内部接口添加默认路由
+            let internal_if_indices = self.internal_if_indices.clone();
+            for (if_name, if_index) in internal_if_indices {
+                info!("Adding default route for interface {} (index {}) to table {}", if_name, if_index, self.table_id);
+                if let Err(e) = self.add_default_route(if_index).await {
+                    error!("Failed to add default route for {}: {}", if_name, e);
+                    // 继续处理其他接口，不要因为一个失败就停止
+                    warn!("Continuing with other interfaces despite default route failure");
                 }
             }
 
@@ -527,6 +692,7 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
             destination: dest,
             output_if_index: self.external_if_index,
             table_id: self.table_id,
+            route_type: RouteType::HairpinDest,
         });
 
         if let Some(ll_addr) = self.get_ll_addr().await? {
@@ -551,14 +717,27 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
         let mut s = self.handle().route().get(route).execute();
 
         while let Some(route) = s.try_next().await? {
-            if self
+            if let Some((_describer_index, describer)) = self
                 .routes
                 .iter()
-                .any(|describer| describer.matches(&route))
+                .enumerate()
+                .find(|(_, describer)| describer.matches(&route))
             {
+                let route_type_str = if describer.is_default_route() {
+                    "default route"
+                } else {
+                    "hairpin destination route"
+                };
+
+                info!("Deleting {} (dest: {:?}, table: {}, oif: {})",
+                      route_type_str,
+                      describer.destination,
+                      describer.table_id,
+                      describer.output_if_index);
+
                 if let Err(e) = self.handle().route().del(route).execute().await {
                     if !(route_err_is_no_entry(&e) || route_err_is_no_dev(&e)) {
-                        error!("failed to delete route: {}", e);
+                        error!("failed to delete {}: {}", route_type_str, e);
                     }
                 }
             }
@@ -574,6 +753,7 @@ impl<N: RouteIpNetwork> HairpinRouting<N> {
         }
 
         self.cache_ll_addr = None;
+        self.internal_if_indices.clear();
 
         Ok(())
     }
@@ -689,6 +869,16 @@ fn link_msg_get_name(msg: LinkMessage) -> Option<String> {
         return None;
     };
     if_name
+}
+
+fn link_name(msg: &LinkMessage) -> String {
+    msg.attributes.iter().find_map(|attr| {
+        if let LinkAttribute::IfName(name) = attr {
+            Some(name.clone())
+        } else {
+            None
+        }
+    }).unwrap_or_else(|| format!("if{}", msg.header.index))
 }
 
 /// This must be called from Tokio context.
