@@ -547,10 +547,14 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
         }
 
         // 方法1: 尝试使用 RouteMessageBuilder 直接创建最简单的默认路由
-        let route1 = RouteMessageBuilder::<IpAddr>::new()
+        let mut route1 = RouteMessageBuilder::<IpAddr>::new()
             .table_id(self.table_id)
             .output_interface(output_if_index)
+            .scope(netlink_packet_route::route::RouteScope::Link) // 设置为链接范围
             .build();
+
+        // 设置协议为Unspec，这样就不会显示proto信息
+        route1.header.protocol = netlink_packet_route::route::RouteProtocol::Unspec;
 
         info!("Attempting to add default route using RouteMessageBuilder");
         if let Err(e1) = self.handle().route().add(route1).execute().await {
@@ -577,12 +581,16 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
                     }
                 };
 
-                let route2 = RouteMessageBuilder::<IpAddr>::new()
+                let mut route2 = RouteMessageBuilder::<IpAddr>::new()
                     .table_id(self.table_id)
                     .output_interface(output_if_index)
                     .destination_prefix(default_dest.ip_addr(), default_dest.prefix_len())
                     .expect("invalid default dest")
+                    .scope(netlink_packet_route::route::RouteScope::Link) // 设置为链接范围
                     .build();
+
+                // 设置协议为Unspec，这样就不会显示proto信息
+                route2.header.protocol = netlink_packet_route::route::RouteProtocol::Unspec;
 
                 if let Err(e2) = self.handle().route().add(route2).execute().await {
                     if route_err_is_exist(&e2) {
@@ -649,15 +657,12 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
                 }
             }
 
-            // 为每个内部接口添加默认路由
-            let internal_if_indices = self.internal_if_indices.clone();
-            for (if_name, if_index) in internal_if_indices {
-                info!("Adding default route for interface {} (index {}) to table {}", if_name, if_index, self.table_id);
-                if let Err(e) = self.add_default_route(if_index).await {
-                    error!("Failed to add default route for {}: {}", if_name, e);
-                    // 继续处理其他接口，不要因为一个失败就停止
-                    warn!("Continuing with other interfaces despite default route failure");
-                }
+            // 添加默认路由，指向外部接口
+            // 注意：默认路由应该指向外部接口（如ppp2），而不是内部接口（如nlbr_ppp2）
+            info!("Adding default route for external interface (index {}) to table {}", self.external_if_index, self.table_id);
+            if let Err(e) = self.add_default_route(self.external_if_index).await {
+                error!("Failed to add default route for external interface: {}", e);
+                warn!("Continuing despite default route failure");
             }
 
             self.hairpin_rule_configured = true;
