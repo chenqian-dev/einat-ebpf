@@ -747,35 +747,132 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
     }
 
     async fn default_gateway_for_external(&self) -> Result<Option<IpAddr>> {
+        // 优先对于 IPv4，从策略路由规则中找到与外部接口源地址匹配的 table，
+        // 再到对应的路由表中查默认网关。
+        if N::IS_IPV4 {
+            let addrs = self
+                .rt_helper
+                .query_all_addresses(self.external_if_index)
+                .await?;
+
+            if let Some(table_id) = self.external_table_from_source_rules(&addrs).await? {
+                if let Some(gw) = self.default_gateway_in_table(table_id).await? {
+                    return Ok(Some(gw));
+                }
+            }
+        }
+
+        // 回退：使用主路由表中的默认路由（保持 ppp/pppoe 行为不变）。
+        self.default_gateway_in_table(RouteHeader::RT_TABLE_MAIN as u32)
+            .await
+    }
+
+    /// 根据源地址匹配 `ip rule` 中的 `from <addr> lookup <table>`，得到外部接口使用的路由表。
+    async fn external_table_from_source_rules(
+        &self,
+        addrs: &IfAddresses,
+    ) -> Result<Option<u32>> {
+        if !N::IS_IPV4 {
+            return Ok(None);
+        }
+
+        let mut rules = self.handle().rule().get(IpVersion::V4).execute();
+        let mut selected: Option<(u32, u32)> = None; // (priority, table_id)
+
+        while let Some(rule) = rules.try_next().await? {
+            if rule.header.family != AddressFamily::Inet {
+                continue;
+            }
+
+            // 只关心 `from <ip>` 规则（IPv4）
+            let src = rule.attributes.iter().find_map(|attr| {
+                if let RuleAttribute::Source(ip) = attr {
+                    if let IpAddr::V4(v4) = ip {
+                        Some(*v4)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let Some(src) = src else {
+                continue;
+            };
+
+            if !addrs.ipv4.contains(&src) {
+                continue;
+            }
+
+            let table_id = rule_table_id(&rule);
+            if table_id == 0 || table_id == ROUTE_LOCAL_TABLE_ID {
+                continue;
+            }
+
+            let priority = rule
+                .attributes
+                .iter()
+                .find_map(|attr| {
+                    if let RuleAttribute::Priority(p) = attr {
+                        Some(*p)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(u32::MAX);
+
+            match &mut selected {
+                None => {
+                    selected = Some((priority, table_id));
+                }
+                Some((best_prio, _)) if priority < *best_prio => {
+                    *best_prio = priority;
+                    selected = Some((priority, table_id));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(selected.map(|(_, table)| table))
+    }
+
+    /// 在指定的路由表中查找 `default via <gw> dev <external_if>` 形式的默认网关。
+    async fn default_gateway_in_table(&self, table_id: u32) -> Result<Option<IpAddr>> {
         let mut route = RouteMessageBuilder::<IpAddr>::new().build();
         route.header.address_family = N::FAMILY;
 
         let mut routes = self.handle().route().get(route).execute();
-        let mut fallback_gateway = None;
 
         while let Some(route) = routes.try_next().await? {
-            if route_table_id(&route) != RouteHeader::RT_TABLE_MAIN as u32 {
+            if route_table_id(&route) != table_id {
                 continue;
             }
+
+            // 只匹配真正的默认路由
             if route.header.destination_prefix_length != 0
                 || route_destination::<N>(&route).is_some()
             {
                 continue;
             }
-            let Some(gateway) = route_gateway(&route) else {
+
+            // 必须是当前外部接口
+            if route_output_if_index(&route) != Some(self.external_if_index) {
                 continue;
+            }
+
+            // ppp/pppoe 通常是 `default dev pppX`，没有 gateway，此时保持链路作用域行为。
+            let Some(gateway) = route_gateway(&route) else {
+                return Ok(None);
             };
+
             if (gateway.is_ipv4() && !N::IS_IPV4) || (gateway.is_ipv6() && N::IS_IPV4) {
                 continue;
             }
 
-            if route_output_if_index(&route) == Some(self.external_if_index) {
-                return Ok(Some(gateway));
-            }
-            fallback_gateway.get_or_insert(gateway);
+            return Ok(Some(gateway));
         }
 
-        Ok(fallback_gateway)
+        Ok(None)
     }
 
     /// 添加默认路由到指定的路由表
@@ -1296,6 +1393,17 @@ fn route_table_id(route: &RouteMessage) -> u32 {
         }
     });
     table_id.unwrap_or(route.header.table as _)
+}
+
+fn rule_table_id(rule: &RuleMessage) -> u32 {
+    let table_id = rule.attributes.iter().find_map(|attr| {
+        if let RuleAttribute::Table(table_id) = attr {
+            Some(*table_id)
+        } else {
+            None
+        }
+    });
+    table_id.unwrap_or(rule.header.table as _)
 }
 
 #[cfg(test)]
