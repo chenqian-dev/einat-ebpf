@@ -160,9 +160,17 @@ pub struct ConfigNetIf {
     #[serde(default)]
     pub timeout_fragment: Option<Timeout>,
     #[serde(default)]
+    pub timeout_icmp_default: Option<Timeout>,
+    #[serde(default)]
+    #[deprecated(since = "0.1.10", note = "use `timeout_udp_min` instead")]
     pub timeout_pkt_min: Option<Timeout>,
     #[serde(default)]
+    #[deprecated(since = "0.1.10", note = "use `timeout_udp_default` instead")]
     pub timeout_pkt_default: Option<Timeout>,
+    #[serde(default)]
+    pub timeout_udp_min: Option<Timeout>,
+    #[serde(default)]
+    pub timeout_udp_default: Option<Timeout>,
     #[serde(default)]
     pub timeout_tcp_trans: Option<Timeout>,
     #[serde(default)]

@@ -155,8 +155,9 @@ impl EinatEbpf for EinatAya {
             ENABLE_FIB_LOOKUP_SRC,
             ALLOW_INBOUND_ICMPX,
             TIMEOUT_FRAGMENT,
-            TIMEOUT_PKT_MIN,
-            TIMEOUT_PKT_DEFAULT,
+            TIMEOUT_ICMP_DEFAULT,
+            TIMEOUT_UDP_MIN,
+            TIMEOUT_UDP_DEFAULT,
             TIMEOUT_TCP_TRANS,
             TIMEOUT_TCP_EST
         );

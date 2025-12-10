@@ -42,8 +42,9 @@ pub struct EinatRoData {
     pub ENABLE_FIB_LOOKUP_SRC: u8,
     pub ALLOW_INBOUND_ICMPX: u8,
     pub TIMEOUT_FRAGMENT: u64,
-    pub TIMEOUT_PKT_MIN: u64,
-    pub TIMEOUT_PKT_DEFAULT: u64,
+    pub TIMEOUT_ICMP_DEFAULT: u64,
+    pub TIMEOUT_UDP_MIN: u64,
+    pub TIMEOUT_UDP_DEFAULT: u64,
     pub TIMEOUT_TCP_TRANS: u64,
     pub TIMEOUT_TCP_EST: u64,
 }
@@ -61,10 +62,11 @@ impl Default for EinatRoData {
             ENABLE_FIB_LOOKUP_SRC: 0,
             ALLOW_INBOUND_ICMPX: 1,
             TIMEOUT_FRAGMENT: 2 * E9,
-            TIMEOUT_PKT_MIN: 120 * E9,
-            TIMEOUT_PKT_DEFAULT: 300 * E9,
+            TIMEOUT_ICMP_DEFAULT: 60 * E9,
+            TIMEOUT_UDP_MIN: 120 * E9,
+            TIMEOUT_UDP_DEFAULT: 300 * E9,
             TIMEOUT_TCP_TRANS: 240 * E9,
-            TIMEOUT_TCP_EST: 7440 * E9,
+            TIMEOUT_TCP_EST: 7200 * E9,
         }
     }
 }

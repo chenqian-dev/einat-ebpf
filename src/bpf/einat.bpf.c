@@ -37,12 +37,14 @@ const volatile u8 ALLOW_INBOUND_ICMPX = true;
 // https://datatracker.ietf.org/doc/html/rfc6146#section-4
 const volatile u64 TIMEOUT_FRAGMENT = 2E9;
 
-const volatile u64 TIMEOUT_PKT_MIN = 120E9;
-const volatile u64 TIMEOUT_PKT_DEFAULT = 300E9;
+const volatile u64 TIMEOUT_ICMP_DEFAULT = 60E9;
+
+const volatile u64 TIMEOUT_UDP_MIN = 120E9;
+const volatile u64 TIMEOUT_UDP_DEFAULT = 300E9;
 
 // https://datatracker.ietf.org/doc/html/rfc6146#section-4
 const volatile u64 TIMEOUT_TCP_TRANS = 240E9;
-const volatile u64 TIMEOUT_TCP_EST = 7440E9;
+const volatile u64 TIMEOUT_TCP_EST = 7200E9;
 
 __be32 g_ipv4_external_addr SEC(".data") = 0;
 #ifdef FEAT_IPV6
@@ -119,7 +121,10 @@ struct {
 } map_ct SEC(".maps");
 
 enum {
-    PKT_CONNLESS,
+    // non-head fragment
+    PKT_FRAGMENT,
+    PKT_ICMP,
+    PKT_UDP,
     PKT_TCP_DATA,
     PKT_TCP_SYN,
     PKT_TCP_RST,
@@ -173,7 +178,8 @@ static __always_inline bool is_icmpx_error_pkt(const struct packet_info *pkt) {
 }
 
 static __always_inline bool pkt_allow_initiating_ct(u8 pkt_type) {
-    return pkt_type == PKT_CONNLESS || pkt_type == PKT_TCP_SYN;
+    return pkt_type == PKT_ICMP || pkt_type == PKT_UDP ||
+           pkt_type == PKT_TCP_SYN;
 }
 
 static __always_inline int parse_ipv4_packet_light(const struct iphdr *iph,
@@ -497,13 +503,13 @@ static __always_inline int parse_packet(struct __sk_buff *skb, bool is_ipv4,
 #endif
     }
 
-    pkt->pkt_type = PKT_CONNLESS;
     pkt->err_l4_off = -1;
     if (pkt->frag_type != FRAG_NONE && pkt->frag_off != 0) {
         // not the first fragment
         pkt->l4_off = -1;
         pkt->tuple.sport = 0;
         pkt->tuple.dport = 0;
+        pkt->pkt_type = PKT_FRAGMENT; // unused
         return TC_ACT_OK;
     }
     pkt->l4_off = l3_off + l3_header_len;
@@ -531,6 +537,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, bool is_ipv4,
         }
         pkt->tuple.sport = udph->source;
         pkt->tuple.dport = udph->dest;
+        pkt->pkt_type = PKT_UDP;
     } else if (is_icmpx(pkt->nexthdr)) {
         struct icmphdr *icmph;
         if (VALIDATE_PULL(skb, &icmph, pkt->l4_off, sizeof(struct icmphdr))) {
@@ -576,6 +583,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, bool is_ipv4,
             bpf_log_error("icmp shot");
             return TC_ACT_SHOT;
         }
+
+        pkt->pkt_type = PKT_ICMP;
     } else {
         return TC_ACT_UNSPEC;
     }
@@ -981,9 +990,11 @@ insert_new_ct(u8 l4proto, const struct map_ct_key *key,
     if (ret) {
         goto delete_ct;
     }
-    ret = bpf_timer_start(
-        &value->timer,
-        l4proto == IPPROTO_TCP ? TIMEOUT_TCP_TRANS : TIMEOUT_PKT_MIN, 0);
+    ret = bpf_timer_start(&value->timer,
+                          l4proto == IPPROTO_TCP   ? TIMEOUT_TCP_TRANS
+                          : l4proto == IPPROTO_UDP ? TIMEOUT_UDP_MIN
+                                                   : TIMEOUT_ICMP_DEFAULT,
+                          0);
     if (ret) {
         goto delete_ct;
     }
@@ -1612,7 +1623,8 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
 
     switch (curr_state) {
     case CT_INIT_IN:
-        if (pkt_type != PKT_CONNLESS && pkt_type != PKT_TCP_SYN) {
+        if (pkt_type != PKT_ICMP && pkt_type != PKT_UDP &&
+            pkt_type != PKT_TCP_SYN) {
             break;
         }
 
@@ -1632,34 +1644,44 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
 
             NEW_STATE(CT_ESTABLISHED);
             __sync_fetch_and_add(&b_value_rev->use, 1);
-            RESET_TIMER(pkt_type == PKT_CONNLESS ? TIMEOUT_PKT_DEFAULT
-                                                 : TIMEOUT_TCP_EST);
+            RESET_TIMER(pkt_type == PKT_ICMP  ? TIMEOUT_ICMP_DEFAULT
+                        : pkt_type == PKT_UDP ? TIMEOUT_UDP_DEFAULT
+                                              : TIMEOUT_TCP_EST);
             bpf_log_debug("INIT_IN -> ESTABLISHED");
         } else if (b_value->use != 0) {
             // XXX: or just don't refresh timer and wait recreating CT instead
-            RESET_TIMER(pkt_type == PKT_CONNLESS ? TIMEOUT_PKT_MIN
-                                                 : TIMEOUT_TCP_TRANS);
+            RESET_TIMER(pkt_type == PKT_ICMP  ? TIMEOUT_ICMP_DEFAULT
+                        : pkt_type == PKT_UDP ? TIMEOUT_UDP_MIN
+                                              : TIMEOUT_TCP_TRANS);
             bpf_log_trace("INIT_IN refresh timer");
         }
         break;
     case CT_INIT_OUT:
-        if (pkt_type != PKT_CONNLESS && pkt_type != PKT_TCP_SYN) {
+        if (pkt_type != PKT_ICMP && pkt_type != PKT_UDP &&
+            pkt_type != PKT_TCP_SYN) {
             break;
         }
+
         if (is_outbound) {
-            RESET_TIMER(pkt_type == PKT_CONNLESS ? TIMEOUT_PKT_MIN
-                                                 : TIMEOUT_TCP_TRANS);
+            RESET_TIMER(pkt_type == PKT_ICMP  ? TIMEOUT_ICMP_DEFAULT
+                        : pkt_type == PKT_UDP ? TIMEOUT_UDP_MIN
+                                              : TIMEOUT_TCP_TRANS);
         } else {
             NEW_STATE(CT_ESTABLISHED);
-            RESET_TIMER(pkt_type == PKT_CONNLESS ? TIMEOUT_PKT_DEFAULT
-                                                 : TIMEOUT_TCP_EST);
+            RESET_TIMER(pkt_type == PKT_ICMP  ? TIMEOUT_ICMP_DEFAULT
+                        : pkt_type == PKT_UDP ? TIMEOUT_UDP_DEFAULT
+                                              : TIMEOUT_TCP_EST);
             bpf_log_debug("INIT_OUT -> ESTABLISHED");
         }
         break;
     case CT_ESTABLISHED:
-        if (pkt_type == PKT_CONNLESS) {
+        if (pkt_type == PKT_ICMP) {
             if (is_outbound) {
-                RESET_TIMER(TIMEOUT_PKT_DEFAULT);
+                RESET_TIMER(TIMEOUT_ICMP_DEFAULT);
+            }
+        } else if (pkt_type == PKT_UDP) {
+            if (is_outbound) {
+                RESET_TIMER(TIMEOUT_UDP_DEFAULT);
             }
         } else if (pkt_type == PKT_TCP_FIN) {
             NEW_STATE(is_outbound ? CT_FIN_OUT : CT_FIN_IN);

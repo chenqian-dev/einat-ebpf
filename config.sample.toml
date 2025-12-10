@@ -68,10 +68,11 @@ allow_inbound_icmpx = true
 # NAT records lifetimes, see <https://datatracker.ietf.org/doc/html/rfc6146#section-4> .
 # See available time units in <https://github.com/fundu-rs/fundu/blob/fundu-v2.0.0/README.md#time-units> .
 timeout_fragment = "2s"
-timeout_pkt_min = "1m"
-timeout_pkt_default = "5m"
+timeout_icmp_default = "1m"
+timeout_udp_min = "2m"
+timeout_udp_default = "5m"
 timeout_tcp_trans = "4m"
-timeout_tcp_est = "124m"
+timeout_tcp_est = "120m"
 
 # Max fragment tracking records allowed.
 frag_track_max_records = 65536
@@ -178,8 +179,10 @@ address = "192.168.4.2"
 # 10.0.0.5) of this CIDR would be used as default NAT external source
 # if this config item got selected.
 network = "10.0.0.5/24"
-# If true, the specified address/network is marked as internal source instead
-# of NAT external source. And such internal source would do NAT explicitly.
+# If `true`, the specified address/network would be marked as internal source
+# instead of NAT external source. This explicitly enable NAT for such internal
+# source. Note all external source config options below would have no effect
+# for internal source.
 is_internal = false
 # If `true`, the address would not be used as target NAT source address,
 # and packet flow from or to this source address would pass through NAT.
@@ -194,7 +197,7 @@ no_hairpin = false
 #icmp_out_ranges = ["1000-65535"]
 
 # You can set ranges to empty `[]` to disable NAT for respective protocol.
-# For example disable NAT for TCP, you can than combine with Netfilter
+# For example disable NAT for TCP, you can then combine with Netfilter
 # masquerading for TCP to form a mixed NAT.
 #tcp_ranges = []
 

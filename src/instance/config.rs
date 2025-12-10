@@ -108,12 +108,27 @@ impl LoadConfig {
         if let Some(v) = config.timeout_fragment {
             ro_data.TIMEOUT_FRAGMENT = v.0;
         }
+        if let Some(v) = config.timeout_icmp_default {
+            ro_data.TIMEOUT_ICMP_DEFAULT = v.0;
+        }
+
+        #[allow(deprecated)]
         if let Some(v) = config.timeout_pkt_min {
-            ro_data.TIMEOUT_PKT_MIN = v.0;
+            ro_data.TIMEOUT_UDP_MIN = v.0;
         }
+        #[allow(deprecated)]
         if let Some(v) = config.timeout_pkt_default {
-            ro_data.TIMEOUT_PKT_MIN = v.0;
+            ro_data.TIMEOUT_UDP_DEFAULT = v.0;
         }
+
+        // prefer timeout_udp_* over timeout_pkt_*
+        if let Some(v) = config.timeout_udp_min {
+            ro_data.TIMEOUT_UDP_MIN = v.0;
+        }
+        if let Some(v) = config.timeout_udp_default {
+            ro_data.TIMEOUT_UDP_DEFAULT = v.0;
+        }
+
         if let Some(v) = config.timeout_tcp_trans {
             ro_data.TIMEOUT_TCP_TRANS = v.0;
         }
