@@ -1612,11 +1612,11 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
 
     switch (curr_state) {
     case CT_INIT_IN:
-        if (is_outbound) {
-            if (pkt_type != PKT_CONNLESS && pkt_type != PKT_TCP_SYN) {
-                break;
-            }
+        if (pkt_type != PKT_CONNLESS && pkt_type != PKT_TCP_SYN) {
+            break;
+        }
 
+        if (is_outbound) {
             struct map_binding_key b_key_rev;
             binding_value_to_key(ifindex, 0, l4proto, b_value, &b_key_rev);
             struct map_binding_value *b_value_rev =
@@ -1633,7 +1633,7 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
             NEW_STATE(CT_ESTABLISHED);
             __sync_fetch_and_add(&b_value_rev->use, 1);
             RESET_TIMER(pkt_type == PKT_CONNLESS ? TIMEOUT_PKT_DEFAULT
-                                                 : TIMEOUT_TCP_TRANS);
+                                                 : TIMEOUT_TCP_EST);
             bpf_log_debug("INIT_IN -> ESTABLISHED");
         } else if (b_value->use != 0) {
             // XXX: or just don't refresh timer and wait recreating CT instead
@@ -1659,11 +1659,8 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
     case CT_ESTABLISHED:
         if (pkt_type == PKT_CONNLESS) {
             if (is_outbound) {
-                RESET_TIMER(TIMEOUT_TCP_EST);
+                RESET_TIMER(TIMEOUT_PKT_DEFAULT);
             }
-        } else if (pkt_type == PKT_TCP_DATA) {
-            // XXX: should we allow refreshing from inbound?
-            RESET_TIMER(TIMEOUT_TCP_EST);
         } else if (pkt_type == PKT_TCP_FIN) {
             NEW_STATE(is_outbound ? CT_FIN_OUT : CT_FIN_IN);
             bpf_log_debug("ESTABLISHED -> FIN_IN/FIN_OUT");
@@ -1671,6 +1668,9 @@ ct_state_transition(u32 ifindex, u8 l4proto, u8 pkt_type, bool is_outbound,
             NEW_STATE(CT_TRANS);
             RESET_TIMER(TIMEOUT_TCP_TRANS);
             bpf_log_debug("ESTABLISHED -> TRANS");
+        } else {
+            // XXX: should we allow refreshing from inbound?
+            RESET_TIMER(TIMEOUT_TCP_EST);
         }
         break;
     case CT_TRANS:
