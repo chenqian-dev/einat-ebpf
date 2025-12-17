@@ -602,6 +602,27 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
         Ok(())
     }
 
+    async fn delete_iptables_rule(&self, binary: &str, args: &[String]) -> Result<()> {
+        let mut delete_args = vec!["-D".to_string(), "FORWARD".to_string()];
+        delete_args.extend_from_slice(args);
+
+        let output = Command::new(binary)
+            .args(&delete_args)
+            .output()
+            .await
+            .with_context(|| format!("failed to execute {} delete command", binary))?;
+
+        if output.status.success() || matches!(output.status.code(), Some(1)) {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "failed to delete {} rule: {}",
+            binary,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
     async fn ensure_forward_rule(&mut self, binary: &'static str, args: Vec<String>) -> Result<()> {
         let tracked = self
             .forward_rules
@@ -660,15 +681,39 @@ impl<N: RouteIpNetwork + std::fmt::Debug> HairpinRouting<N> {
                 continue;
             }
 
+            for ctstate in ["ESTABLISHED,RELATED", "RELATED,ESTABLISHED"] {
+                let deprecated_forward_args = vec![
+                    "-i".to_string(),
+                    ext_if_name.clone(),
+                    "-o".to_string(),
+                    internal_if.clone(),
+                    "-m".to_string(),
+                    "conntrack".to_string(),
+                    "--ctstate".to_string(),
+                    ctstate.to_string(),
+                    "-j".to_string(),
+                    "ACCEPT".to_string(),
+                ];
+
+                if let Err(e) = self
+                    .delete_iptables_rule(binary, &deprecated_forward_args)
+                    .await
+                {
+                    if !self.iptables_warned {
+                        warn!(
+                            "failed to delete deprecated iptables forward rule {:?}: {}. continuing",
+                            deprecated_forward_args, e
+                        );
+                        self.iptables_warned = true;
+                    }
+                }
+            }
+
             forward_args = vec![
                 "-i".to_string(),
                 ext_if_name.clone(),
                 "-o".to_string(),
                 internal_if.clone(),
-                "-m".to_string(),
-                "conntrack".to_string(),
-                "--ctstate".to_string(),
-                "ESTABLISHED,RELATED".to_string(),
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ];
