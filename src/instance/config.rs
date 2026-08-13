@@ -590,6 +590,23 @@ fn sort_and_merge_ranges(ranges: &[RangeInclusive<u16>]) -> Vec<RangeInclusive<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_packet_timeouts_are_loaded_into_their_matching_udp_fields() {
+        let config = ConfigNetIf {
+            bpf_fib_lookup_external: Some(false),
+            timeout_pkt_min: Some(std::time::Duration::from_secs(5).into()),
+            timeout_pkt_default: Some(std::time::Duration::from_secs(15).into()),
+            ..Default::default()
+        };
+
+        let loaded = LoadConfig::from(&config, false);
+
+        assert_eq!(loaded.0.ro_data.TIMEOUT_UDP_MIN, 5_000_000_000);
+        assert_eq!(loaded.0.ro_data.TIMEOUT_UDP_DEFAULT, 15_000_000_000);
+    }
+
     #[test]
     fn external_range() {
         let ranges_a = vec![
